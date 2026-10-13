@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Study Agent</title>
+<style>
+:root{font-family:system-ui,sans-serif;color:#1c2939;background:#f3f5f8}*{box-sizing:border-box}body{margin:0}main{max-width:880px;margin:auto;padding:28px 20px}header{display:flex;justify-content:space-between;align-items:center;gap:16px}h1{font-size:26px;margin:0}p{line-height:1.6}.subtitle{color:#637087;font-size:14px}button{border:0;border-radius:9px;padding:11px 18px;background:#214fbb;color:white;cursor:pointer;font:inherit}button.secondary{background:#e4e9f1;color:#243752}button.deny{background:#f9e5e5;color:#9c2828}button:disabled{opacity:.5;cursor:default}#chat{min-height:360px;margin:24px 0;display:flex;flex-direction:column;gap:14px}.card{background:white;border:1px solid #dde4ed;border-radius:12px;padding:16px 18px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6}.user{background:#e8efff;margin-left:60px}.label{font-size:12px;color:#65748b;margin-bottom:6px}.usage{font-size:12px;color:#65748b;padding:2px 8px}.approval{border-color:#e4b66b;background:#fffcf3}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;margin:8px 0 14px}.actions{display:flex;gap:10px}form{position:sticky;bottom:0;background:#f3f5f8;padding:14px 0;display:flex;align-items:flex-end;gap:10px}textarea{resize:vertical;min-height:70px;max-height:240px;flex:1;padding:14px;border:1px solid #bac7db;border-radius:10px;font:inherit}#status{font-size:13px;color:#526780;min-height:22px}.error{color:#a32626}.empty{color:#708096;text-align:center;padding:70px 10px}@media(max-width:520px){main{padding:20px 12px}.user{margin-left:20px}h1{font-size:22px}}
+</style>
+<main>
+<header><div><h1>AI Study Agent</h1><div class="subtitle">研究助手 · 本地 bash 工具 · 每条命令由你批准</div></div><button id="reset" class="secondary">新对话</button></header>
+<div id="chat" aria-live="polite"><div class="empty">从“这个文件夹有哪些文件？”开始试试。<br>助手需要执行命令时，会先等待你的批准。</div></div>
+<div id="status" role="status">就绪</div>
+<form id="form"><textarea id="message" aria-label="消息" placeholder="输入问题… Enter 发送，Shift+Enter 换行" required></textarea><button id="send">发送</button></form>
+</main>
+<script>
+const token='__TOKEN__';let offset=0,busy=false;const chat=document.querySelector('#chat'),status=document.querySelector('#status'),input=document.querySelector('#message');
+async function request(path,body){const response=await fetch(path,{method:body?'POST':'GET',headers:{'X-Session-Token':token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const data=await response.json();if(!response.ok)throw Error(data.error||'请求失败');return data}
+function card(label,text,cls=''){chat.querySelector('.empty')?.remove();const node=document.createElement('div');node.className='card '+cls;const title=document.createElement('div');title.className='label';title.textContent=label;const content=document.createElement('div');content.textContent=text;node.append(title,content);chat.append(node);return node}
+function render(event){const d=event.data;
+if(event.kind==='user')card('你',d,'user');
+if(event.kind==='text')card('助手',d);
+if(event.kind==='error')card('错误',d,'error');
+if(event.kind==='usage'){const node=document.createElement('div');node.className='usage';let text=`本次调用 · 输入 ${d.prompt_tokens??'未知'} · 输出 ${d.completion_tokens??'未知'}`;const cached=d.prompt_tokens_details?.cached_tokens;if(cached!==undefined)text+=` · 缓存输入 ${cached}`;if(d.cost!==undefined)text+=` · $${d.cost.toFixed(8)}`;node.textContent=text;chat.append(node)}
+if(event.kind==='approval'){const node=card('等待批准 · bash', '', 'approval');node.dataset.id=d.id;const pre=document.createElement('pre');pre.textContent=d.command;const actions=document.createElement('div');actions.className='actions';for(const [label,approved,cls] of [['批准',true,''],['拒绝',false,'deny']]){const button=document.createElement('button');button.textContent=label;button.className=cls;button.onclick=async()=>{actions.querySelectorAll('button').forEach(b=>b.disabled=true);try{await request('/approve',{id:d.id,approved})}catch(e){status.textContent=e.message;actions.querySelectorAll('button').forEach(b=>b.disabled=false)}};actions.append(button)}node.append(pre,actions);status.textContent='等待你批准或拒绝命令'}
+if(event.kind==='decision'){const node=[...chat.querySelectorAll('[data-id]')].find(n=>n.dataset.id===d.id);if(node){node.querySelectorAll('button').forEach(b=>b.disabled=true);const note=document.createElement('div');note.textContent=d.approved?'已批准，正在执行…':'已拒绝';node.append(note)}}
+if(event.kind==='tool_result'){let text=d.error||`退出码：${d.exit_code}${d.timed_out?' · 超时':''}\n${d.stdout||''}${d.stderr?'\n标准错误：\n'+d.stderr:''}`;card('命令结果',text)}
+if(event.kind==='reset')chat.replaceChildren();
+if(event.kind==='done')status.textContent='就绪';
+}
+async function poll(){try{const data=await request('/events?after='+offset);data.events.forEach(render);offset=data.next;busy=data.busy;document.querySelector('#send').disabled=busy;document.querySelector('#reset').disabled=busy;if(busy&&!chat.querySelector('.approval button:not(:disabled)'))status.textContent='助手正在处理…';if(data.events.length)window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'})}catch(e){status.textContent='连接中断，请确认本地服务仍在运行。'}setTimeout(poll,500)}
+document.querySelector('#form').onsubmit=async e=>{e.preventDefault();if(busy||!input.value.trim())return;const message=input.value;document.querySelector('#send').disabled=true;try{await request('/chat',{message});input.value='';busy=true;status.textContent='助手正在处理…'}catch(e){status.textContent=e.message;document.querySelector('#send').disabled=false}};
+input.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();document.querySelector('#form').requestSubmit()}};
+document.querySelector('#reset').onclick=async()=>{try{await request('/reset',{});status.textContent='已开始新对话'}catch(e){status.textContent=e.message}};
+poll();
+</script>
+</html>
