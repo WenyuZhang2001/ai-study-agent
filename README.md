@@ -47,4 +47,4 @@ API connectivity, text replies and tool-call support passed. The student explain
 
 Testing was on macOS. At the student's request, the home-directory size scan was not performed; disposable sample folders were used instead. Linux and Windows instructions are provided but have not been tested on those platforms. Cached token reporting was verified with a reported value of zero; a cache hit was not observed.
 
-Next: validate installation from the public repository, then submit the install skill to the class repository after the student's PR checkpoint.
+Published at https://github.com/WenyuZhang2001/ai-study-agent. A fresh clone successfully started with uv; approved listing, denied commands, token reporting and conversation reset passed. The temporary clone was removed. Next: open the course submission PR after the student's checkpoint.
