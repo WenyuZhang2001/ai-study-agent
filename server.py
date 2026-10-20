@@ -10,6 +10,7 @@ from api import ROOT
 
 TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.RLock()
+runtime = None
 agent = Agent()
 events = []
 busy = False
@@ -118,25 +119,49 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/reset':
                 if busy:
                     return self.reply(409, {'error': 'Finish or deny the current turn first'})
-                agent = Agent()
+                agent = Agent(runtime=runtime)
                 emit('reset', None)
             else:
                 return self.reply(404, {'error': 'Not found'})
         self.reply(200, {'ok': True})
 
 
-if __name__ == '__main__':
+def main():
+    global runtime, agent
     import argparse
+    from plugins import PluginRuntime
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--no-browser', action='store_true')
+    parser.add_argument('--telegram', action='store_true', help='Use Telegram questions and reply-based approvals')
+    parser.add_argument('--no-plugins', action='store_true', help='Run the original bash-only web agent')
     args = parser.parse_args()
-    server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
-    url = f'http://127.0.0.1:{server.server_port}'
-    print(f'AI Study Agent: {url}', flush=True)
-    if not args.no_browser:
-        webbrowser.open(url)
+    if args.telegram and args.no_plugins:
+        parser.error('--telegram requires plugins')
+    server = None
     try:
-        server.serve_forever()
+        runtime = None if args.no_plugins else PluginRuntime()
+        if args.telegram:
+            from telegram_mode import run_telegram
+            run_telegram(runtime)
+        else:
+            agent = Agent(runtime=runtime)
+            server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
+            url = f'http://127.0.0.1:{server.server_port}'
+            print(f'AI Study Agent: {url}', flush=True)
+            if not args.no_browser:
+                webbrowser.open(url)
+            server.serve_forever()
     except KeyboardInterrupt:
-        server.server_close()
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        print('Stopping agent.', flush=True)
+    finally:
+        if server:
+            server.server_close()
+        if runtime:
+            runtime.close()
+
+
+if __name__ == '__main__':
+    main()

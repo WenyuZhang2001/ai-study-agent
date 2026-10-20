@@ -1,0 +1,5 @@
+{
+  "allow": [
+    "telegram__send_message"
+  ]
+}

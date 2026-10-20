@@ -1,0 +1,44 @@
+{
+  "stocks": [
+    {
+      "symbol": "AAPL",
+      "benchmark": "QQQ"
+    },
+    {
+      "symbol": "MSFT",
+      "benchmark": "QQQ"
+    },
+    {
+      "symbol": "NVDA",
+      "benchmark": "SMH"
+    },
+    {
+      "symbol": "AMZN",
+      "benchmark": "QQQ"
+    },
+    {
+      "symbol": "GOOGL",
+      "benchmark": "QQQ"
+    },
+    {
+      "symbol": "META",
+      "benchmark": "QQQ"
+    },
+    {
+      "symbol": "AMD",
+      "benchmark": "SMH"
+    },
+    {
+      "symbol": "AVGO",
+      "benchmark": "SMH"
+    },
+    {
+      "symbol": "TSM",
+      "benchmark": "SMH"
+    },
+    {
+      "symbol": "TSLA",
+      "benchmark": "QQQ"
+    }
+  ]
+}
