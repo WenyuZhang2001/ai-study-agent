@@ -85,4 +85,4 @@ Local research receipts and generated outputs are ignored under `research-output
 
 ## Status
 
-Week 3 implementation and local/phone/Codex acceptance are complete. Public push and the course pull request remain pending the student's publication checkpoint. The normal Telegram receiver was restored during this session; verify the local process is still running before relying on phone access.
+Week 3 is published and submitted: https://github.com/huangzesen/ai-in-research-homework/pull/18 . The PR is open for review and contains only the 13 files under week-3/submissions/wenyuzhang2001/. The course workflow succeeded: the author-folder plan check passed and the benchmark-task validate job was skipped, as expected for this plugin submission. Local acceptance includes all 44 automated checks plus phone and Codex tests described above. The normal Telegram receiver was restored during this session; verify the local process is still running before relying on phone access.
