@@ -76,4 +76,4 @@ def agent_type_prompt(types):
     if not types:
         return ''
     return 'Available subagent types (names and descriptions only; use delegate for hand-off, or subagent start/wait for parallel work; include complete tasks):\n' + '\n'.join(
-        f'- {kind.name}: {kind.description}' for kind in types.values())
+        f'- {kind.name}: {kind.description}' for kind in types.values()) + '\nFailed children provide only explicitly returned reports/statistics. Never infer market prices or other missing observations from their task, state or turn count.'

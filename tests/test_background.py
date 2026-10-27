@@ -183,6 +183,20 @@ class BackgroundTests(unittest.TestCase):
         self.assertEqual(peak,1)
         shell.assert_not_called()
 
+    def test_failed_child_final_response_cannot_invent_unreturned_observations(self):
+        self.rt.agent_types['worker']=AgentType('worker','Limited',('research__read',),'Worker prompt',1)
+        with patch('agent.complete',return_value=completion([call('research__read',{})])):
+            identity=self.start()
+            self.manager.wait([identity],3)
+        events=[]
+        with patch('agent.complete',return_value=completion(content='The unreturned stock price is $9999.')):
+            report=self.main.ask('Report status',lambda _:False,lambda k,v:events.append((k,v)))
+        self.assertIn('Turn limit exceeded',report)
+        self.assertNotIn('$9999',report)
+        self.assertNotIn('$9999',json.dumps(self.main.messages))
+        self.assertNotIn('$9999',self.main.log_path.read_text())
+        self.assertEqual([v for k,v in events if k=='text'],[report])
+
     def test_shutdown_stops_children_and_delivers_stop_note_after_idle(self):
         with patch('agent.complete',return_value=completion(content='report')):
             identity=self.start();self.manager.wait([identity],3)

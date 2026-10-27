@@ -287,6 +287,8 @@ class Agent:
         proposal_repairs = 0
         force_final = False
         final_repairs = 0
+        failed_child_ids = set()
+        observed_child_ids = set()
         for round_index in range(max_rounds + 1):
             self._check_limits()
             pending = self.take_pending()
@@ -295,6 +297,8 @@ class Agent:
             if self.delegations:
                 notes = self.delegations.drain_notes()
                 if notes:
+                    observed_child_ids.update(note['id'] for note in notes)
+                    failed_child_ids.update(note['id'] for note in notes if note['state']=='failed')
                     self._append({'role':'user','content':'[subagent notes] '+json.dumps(notes,ensure_ascii=False)})
             model_options = {'model': self.model} if self.model else {}
             if self.agent_type != 'main' or self.id != 'main':
@@ -319,8 +323,18 @@ class Agent:
             calls = message.get('tool_calls', [])
             if calls:
                 assistant['tool_calls'] = calls
+            grounded_failure = not calls and bool(failed_child_ids) and self.delegations is not None
+            if grounded_failure:
+                # Failed children may return no research facts. Do not let a final
+                # model response invent missing observations from a task name.
+                statuses=[row for row in self.delegations.list() if row['id'] in observed_child_ids]
+                content='子 agent 执行状态（程序记录）：\n'+'\n\n'.join(
+                    row['stats']+'\n'+(row['report'] or 'No report returned.') for row in statuses)
+                assistant['content']=content
+                self._log('response_grounding',{'reason':'failed child; use verified reports and statistics only',
+                                                'ids':sorted(observed_child_ids)})
             self._append(assistant)
-            if not calls and result['choices'][0].get('finish_reason') == 'length' and final_repairs == 0 and round_index < max_rounds:
+            if not calls and not grounded_failure and result['choices'][0].get('finish_reason') == 'length' and final_repairs == 0 and round_index < max_rounds:
                 final_repairs += 1
                 force_final = True
                 self._append({'role': 'system', 'content':
@@ -390,6 +404,13 @@ class Agent:
                 except (ValueError, KeyError, TypeError, OSError, RuntimeError, TimeoutError) as error:
                     output = {'error': redact(error)}
                 self._check_cancel()
+                if self.delegations:
+                    rows=output if isinstance(output,list) else [output]
+                    for row in rows:
+                        if isinstance(row,dict) and row.get('id') in self.delegations.children:
+                            observed_child_ids.add(row['id'])
+                            if row.get('state')=='failed':
+                                failed_child_ids.add(row['id'])
                 # Raw secrets never enter model context or interface events.
                 encoded = redact(json.dumps(output, ensure_ascii=False))
                 if len(encoded) > 60000:
