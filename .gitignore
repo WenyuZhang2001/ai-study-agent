@@ -5,3 +5,6 @@ __pycache__/
 research-output/
 
 .pytest_cache/
+
+# Private agent conversations and tool results
+logs/

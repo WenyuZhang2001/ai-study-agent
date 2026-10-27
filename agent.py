@@ -1,8 +1,16 @@
 """The agent loop: model -> approved bash -> tool result -> model."""
 import json
+import copy
+from datetime import datetime, timezone
+import queue
+import threading
+import time
+import uuid
 import os
 import re
 import signal
+import shlex
+from pathlib import Path
 import subprocess
 from api import ROOT, complete
 
@@ -58,24 +66,126 @@ def is_prose_approval_request(text):
 
 
 class Agent:
-    def __init__(self, workdir=ROOT, runtime=None, telegram=False):
+    def __init__(self, workdir=ROOT, runtime=None, telegram=False, *,
+                 agent_id='main', agent_type='main', system_prompt=None,
+                 tools=None, max_turns=20, time_limit=600, log_path=None):
         self.workdir = str(workdir)
         self.runtime, self.telegram = runtime, telegram
         self.first_usage_reported = False
-        prompt = (ROOT / 'system_prompt.md').read_text()
-        if runtime:
+        if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1:
+            raise ValueError('max_turns must be a positive integer.')
+        if not isinstance(time_limit, (int, float)) or not 0 < time_limit < float('inf'):
+            raise ValueError('time_limit must be positive and finite.')
+        self.id, self.agent_type = agent_id, agent_type
+        self.max_turns, self.time_limit = max_turns, time_limit
+        self.state, self.report, self.failure_reason = 'idle', '', None
+        self.inbox = queue.Queue()
+        self.stop_event = threading.Event()
+        self.process = None
+        self.turns = 0
+        self.usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+        self.started_at, self.deadline = None, None
+        self._turn_lock = threading.Lock()
+        self._log_lock = threading.Lock()
+        # A unique session directory keeps new conversations from sharing a log.
+        session = uuid.uuid4().hex
+        self.log_path = Path(log_path) if log_path is not None else Path(workdir) / 'logs' / session / 'main.jsonl'
+        defaults = [BASH] + ([t for t in runtime.tools
+                    if not (telegram and t['function']['name'] == 'telegram__wait_for_messages')]
+                    if runtime else [])
+        self.tools = copy.deepcopy(defaults if tools is None else tools)
+        prompt = (ROOT / 'system_prompt.md').read_text() if system_prompt is None else system_prompt
+        if runtime and system_prompt is None:
             prompt += '\n\n' + runtime.skill_prompt()
-        if telegram:
+        if telegram and system_prompt is None:
             prompt += '\nTelegram mode: the harness owns incoming messages and sends your final reply. Never poll messages via bash or tools. Use send_message only for short progress updates. For phone replies use at most 350 Chinese characters or 180 English words. Avoid tables. Put the requested verdict and net-of-cost simulation figures before secondary diagnostics; include data date and limitations.'
+        self.system_prompt = prompt
         self.messages = [{'role': 'system', 'content': prompt}]
+        self._initial_log_written = False
 
-    def ask(self, prompt, approve, emit, max_rounds=20):
-        """Run one turn; a denial disables every remaining tool for this turn."""
-        redact = self.runtime.redact if self.runtime else str
-        self.messages.append({'role': 'user', 'content': redact(prompt)})
-        tools = [BASH] + ([t for t in self.runtime.tools
-                  if not (self.telegram and t['function']['name'] == 'telegram__wait_for_messages')]
-                  if self.runtime else [])
+    def _redact(self, value):
+        return self.runtime.redact(str(value)) if self.runtime else str(value)
+
+    def _log(self, event, data):
+        # Redact the serialized payload before it reaches disk, including tool args.
+        record = {'time': datetime.now(timezone.utc).isoformat(), 'agent_id': self.id,
+                  'agent_type': self.agent_type, 'event': event,
+                  'data': json.loads(self._redact(json.dumps(data, ensure_ascii=False)))}
+        with self._log_lock:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Runtime transcripts can contain private mail; keep them local/private.
+            fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, 'a') as stream:
+                stream.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+    def _append(self, message):
+        safe = json.loads(self._redact(json.dumps(message, ensure_ascii=False)))
+        self.messages.append(safe)
+        self._log('message', safe)
+
+    def _record_usage(self, usage):
+        prompt = usage.get('prompt_tokens') or 0
+        completion = usage.get('completion_tokens') or 0
+        for key, value in (('prompt_tokens', prompt), ('completion_tokens', completion),
+                           ('total_tokens', usage.get('total_tokens', prompt + completion) or 0)):
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                self.usage[key] += value
+        self._log('usage', usage)
+
+    def skill_read_path(self, command):
+        """Recognize only a plain cat of a registered plugin skill; never run it as shell."""
+        if not self.runtime:
+            return None
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            return None
+        if words[:2] == ['cat', '--']:
+            words = ['cat'] + words[2:]
+        if len(words) != 2 or words[0] != 'cat':
+            return None
+        candidate = Path(words[1])
+        if not candidate.is_absolute():
+            return None
+        for skill in getattr(self.runtime, 'skills', []):
+            if str(candidate) == skill['path'] and not candidate.is_symlink():
+                return candidate
+        return None
+
+    def ask(self, prompt, approve, emit, max_rounds=None):
+        """Run a turn on this agent's private context; reject concurrent turns."""
+        if not self._turn_lock.acquire(blocking=False):
+            raise RuntimeError('This agent already has a running turn.')
+        try:
+            if self.state in ('stopped', 'failed'):
+                raise RuntimeError('This agent is stopped or failed; create a new agent.')
+            if not self._initial_log_written:
+                self._log('message', self.messages[0])
+                self._initial_log_written = True
+            self.state = 'running'
+            self.report = ''
+            if self.started_at is None:
+                self.started_at = time.monotonic()
+                self.deadline = self.started_at + self.time_limit
+            self._log('state', {'state': self.state})
+            try:
+                result = self._ask(prompt, approve, emit,
+                                   self.max_turns if max_rounds is None else max_rounds)
+            except BaseException:
+                self.state, self.failure_reason = 'failed', 'Agent turn failed.'
+                self._log('state', {'state': self.state, 'reason': self.failure_reason})
+                raise
+            self.report, self.state = result, 'idle'
+            self._log('state', {'state': self.state, 'report': result})
+            return result
+        finally:
+            self._turn_lock.release()
+
+    def _ask(self, prompt, approve, emit, max_rounds):
+        """Existing loop and approval semantics, using per-agent tools/state."""
+        redact = self._redact
+        self._append({'role': 'user', 'content': redact(prompt)})
+        tools = self.tools
         available = {t['function']['name'] for t in tools}
         denied = False
         force_proposal = False
@@ -86,7 +196,9 @@ class Agent:
             result = complete(self.messages, tools=tools,
                               max_tokens=2048, tool_choice='none' if denied or force_final or round_index == max_rounds else ('required' if force_proposal else 'auto'))
             force_proposal = False
+            self.turns += 1
             usage = result.get('usage', {})
+            self._record_usage(usage)
             emit('usage', usage)
             if not self.first_usage_reported:
                 print('First model call input tokens: ' + str(usage.get('prompt_tokens', 'not reported')), flush=True)
@@ -97,18 +209,18 @@ class Agent:
             calls = message.get('tool_calls', [])
             if calls:
                 assistant['tool_calls'] = calls
-            self.messages.append(assistant)
+            self._append(assistant)
             if not calls and result['choices'][0].get('finish_reason') == 'length' and final_repairs == 0 and round_index < max_rounds:
                 final_repairs += 1
                 force_final = True
-                self.messages.append({'role': 'system', 'content':
+                self._append({'role': 'system', 'content':
                     'Your reply was truncated. Give one complete concise final answer from the existing results, at most 350 Chinese characters or 180 English words. Put requested net-of-cost figures and verdict first. Do not call any tools.'})
                 continue
             if not calls and is_prose_approval_request(content):
                 if not denied and not force_final and proposal_repairs == 0 and round_index < max_rounds:
                     proposal_repairs += 1
                     force_proposal = True
-                    self.messages.append({'role': 'system', 'content':
+                    self._append({'role': 'system', 'content':
                         'Your prose did not create an approval. Propose the intended action with an actual structured tool call now. The harness will request human approval before execution. Do not claim approval was granted or execute via another route.'})
                     continue
                 content = ('本轮请求已被拒绝，不会再执行工具或寻求替代批准。' if denied else
@@ -133,11 +245,13 @@ class Agent:
                     elif round_index == max_rounds:
                         output = {'error': 'Tool round limit reached.'}
                     else:
-                        allowed = name != 'bash' and self.runtime and name in self.runtime.allow
+                        skill_path = self.skill_read_path(arguments['command']) if name == 'bash' else None
+                        allowed = skill_path is not None or (name != 'bash' and self.runtime and name in self.runtime.allow)
                         description = arguments['command'] if name == 'bash' else 'MCP tool ' + name + '\n' + json.dumps(arguments, ensure_ascii=False)
                         if allowed or approve(redact(description)):
                             if name == 'bash':
-                                output = run_bash(arguments['command'], self.workdir)
+                                output = ({'stdout': skill_path.read_text(), 'stderr': '', 'exit_code': 0}
+                                          if skill_path is not None else run_bash(arguments['command'], self.workdir))
                             else:
                                 output = self.runtime.call(name, arguments)
                         else:
@@ -151,7 +265,7 @@ class Agent:
                     encoded = json.dumps({'text': encoded[:60000], 'truncated': True})
                 safe_output = json.loads(encoded)
                 emit('tool_result', safe_output)
-                self.messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': encoded})
+                self._append({'role': 'tool', 'tool_call_id': call['id'], 'content': encoded})
         text = 'Tool round limit reached. Please start a new question.'
         emit('text', text)
         return text
