@@ -4,6 +4,7 @@ import json
 import secrets
 import sys
 import time
+import threading
 
 from agent import Agent
 
@@ -20,8 +21,14 @@ class TelegramChannel:
         self.pending_questions = deque()
         self.buffer = deque()
         self.poll_failures = 0
+        self.io_lock=threading.RLock()
+        self._idle_yield=threading.Event()
 
-    def send(self, text, request_reply=False):
+    def send(self,text,request_reply=False):
+        with self.io_lock:
+            return self._send(text,request_reply)
+
+    def _send(self, text, request_reply=False):
         # Retrying delivery may duplicate a message after an ambiguous timeout;
         # it never reruns a model turn or shell command.
         delay = 1
@@ -39,7 +46,11 @@ class TelegramChannel:
                 time.sleep(delay)
                 delay = min(delay * 2, 15)
 
-    def poll(self, seconds=30, deadline=None):
+    def poll(self,seconds=30,deadline=None):
+        with self.io_lock:
+            return self._poll(seconds,deadline)
+
+    def _poll(self, seconds=30, deadline=None):
         try:
             result = self.runtime.call('telegram__wait_for_messages', {'seconds': seconds})
             if result['is_error']:
@@ -56,9 +67,15 @@ class TelegramChannel:
             time.sleep(delay)
             return []
 
-    def approve(self, description):
+    def approve(self,description,cancel=None):
+        with self.io_lock:
+            return self._approve(description,cancel)
+
+    def _approve(self, description, cancel=None):
         # Drain already queued messages before creating a new approval. A previous
         # 'yes' cannot approve a future command, even if it arrived in the same batch.
+        if cancel and cancel.is_set():
+            return False
         prior = list(self.buffer) + self.poll(0)
         self.buffer.clear()
         for message in prior:
@@ -70,7 +87,11 @@ class TelegramChannel:
         print(f'Approval {approval_id} waiting; message IDs {ids}.', flush=True)
         deadline = time.monotonic() + self.approval_timeout
         while time.monotonic() < deadline:
-            messages = self.poll(max(0, min(30, int(deadline-time.monotonic()))), deadline=deadline)
+            if cancel and cancel.is_set():
+                return False
+            messages = self.poll(max(0, min(1 if cancel else 30, int(deadline-time.monotonic()))), deadline=deadline)
+            if cancel and cancel.is_set():
+                return False
             if time.monotonic() >= deadline:
                 break
             decision = None
@@ -92,11 +113,18 @@ class TelegramChannel:
 
     def next_question(self):
         while True:
-            if self.pending_questions:
-                return self.pending_questions.popleft()
-            if self.buffer:
-                return self.buffer.popleft()
-            self.buffer.extend(self.poll())
+            # Release between short polls so a background approval or completion
+            # notice can acquire the channel while the user is otherwise idle.
+            with self.io_lock:
+                if self.pending_questions:
+                    return self.pending_questions.popleft()
+                if self.buffer:
+                    return self.buffer.popleft()
+                self.buffer.extend(self.poll(seconds=1))
+            self._idle_yield.wait(.01)
+
+
+TelegramChannel.approve.supports_cancel=True
 
 
 def run_telegram(runtime):
@@ -107,21 +135,34 @@ def run_telegram(runtime):
     agent = Agent(runtime=runtime, telegram=True)
     channel.send('研究 agent 已上线。可以直接提问；执行命令前会请你“回复”审批消息并输入 yes/no。\n/new 开始新对话。研究模型尚未证明预测优势，不会自动下单。')
     print('Telegram agent ready; waiting for messages.', flush=True)
-    while True:
-        message = channel.next_question()
-        prompt = message['text'].strip()
-        # Stale approvals are control messages, never new model questions.
-        if is_approval_word(prompt):
-            channel.send('当前没有等待中的审批，这条确认未执行任何命令。请先发送新的问题；出现编号审批后，在它的回复框输入英文 yes 或 no。')
-            continue
-        if prompt == '/new':
-            agent = Agent(runtime=runtime, telegram=True)
-            channel.send('已开始新对话。')
-            continue
-        channel.send('收到，正在处理。')
-        try:
-            final = agent.ask(prompt, channel.approve, lambda kind, data: None)
-            channel.send(final or '本轮处理完成。')
-        except Exception:
-            channel.send('本轮请求失败，未显示内部错误或凭据。请检查本地连接；可用 /new 开始新对话。')
-            agent = Agent(runtime=runtime, telegram=True)
+    try:
+        while True:
+            message = channel.next_question()
+            prompt = message['text'].strip()
+            # Stale approvals are control messages, never new model questions.
+            if is_approval_word(prompt):
+                channel.send('当前没有等待中的审批，这条确认未执行任何命令。请先发送新的问题；出现编号审批后，在它的回复框输入英文 yes 或 no。')
+                continue
+            if prompt == '/agents':
+                states=agent.delegations.list() if agent.delegations else []
+                channel.send('\n'.join(f"{r['id']} · {r['agent']} · {r['state']} · {r['turns']}轮 · {r['tokens']} tokens · {r['seconds']}s" for r in states) or '暂无子 agent。')
+                continue
+            if prompt == '/new':
+                agent.close()
+                agent = Agent(runtime=runtime, telegram=True)
+                channel.send('已开始新对话。')
+                continue
+            channel.send('收到，正在处理。')
+            try:
+                owner=agent
+                def notice(kind,data):
+                    if kind=='subagent_note' and agent is owner:
+                        channel.send(f"[{data['id']} · {data['agent']} · {data['state']}]\n"+data['report'][:2000])
+                final = agent.ask(prompt, channel.approve, notice)
+                channel.send(final or '本轮处理完成。')
+            except Exception:
+                channel.send('本轮请求失败，未显示内部错误或凭据。请检查本地连接；可用 /new 开始新对话。')
+                agent.close()
+                agent = Agent(runtime=runtime, telegram=True)
+    finally:
+        agent.close()

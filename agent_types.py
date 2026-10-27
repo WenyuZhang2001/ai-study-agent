@@ -75,5 +75,5 @@ def load_agent_types(directory, tools):
 def agent_type_prompt(types):
     if not types:
         return ''
-    return 'Available subagent types (names and descriptions only; use delegate with a complete task):\n' + '\n'.join(
+    return 'Available subagent types (names and descriptions only; use delegate for hand-off, or subagent start/wait for parallel work; include complete tasks):\n' + '\n'.join(
         f'- {kind.name}: {kind.description}' for kind in types.values())

@@ -9,6 +9,7 @@
 <main>
 <header><div><h1>AI Study Agent</h1><div class="subtitle">研究助手 · MCP 研究工具 · 命令与未信任工具需要批准</div></div><button id="reset" class="secondary">新对话</button></header>
 <div id="chat" aria-live="polite"><div class="empty">从“这个文件夹有哪些文件？”开始试试。<br>助手需要执行命令时，会先等待你的批准。</div></div>
+<details><summary>后台子 agent</summary><pre id="agents">暂无子 agent</pre></details>
 <div id="status" role="status">就绪</div>
 <form id="form"><textarea id="message" aria-label="消息" placeholder="输入问题… Enter 发送，Shift+Enter 换行" required></textarea><button id="send">发送</button></form>
 </main>
@@ -20,6 +21,8 @@ function render(event){const d=event.data;
 if(event.kind==='user')card('你',d,'user');
 if(event.kind==='text')card('助手',d);
 if(event.kind==='error')card('错误',d,'error');
+if(event.kind==='subagent_note')card(`子 agent ${d.id} · ${d.state}`,d.report||d.stats);
+if(event.kind==='subagent_usage'){const n=document.createElement('div');n.className='usage';n.textContent=`子 agent ${d.id} · 输入 ${d.usage.prompt_tokens??'未知'} · 输出 ${d.usage.completion_tokens??'未知'}`;chat.append(n)}
 if(event.kind==='usage'){const node=document.createElement('div');node.className='usage';let text=`本次调用 · 输入 ${d.prompt_tokens??'未知'} · 输出 ${d.completion_tokens??'未知'}`;const cached=d.prompt_tokens_details?.cached_tokens;if(cached!==undefined)text+=` · 缓存输入 ${cached}`;if(d.cost!==undefined)text+=` · $${d.cost.toFixed(8)}`;node.textContent=text;chat.append(node)}
 if(event.kind==='approval'){const node=card('等待批准 · 工具请求', '', 'approval');node.dataset.id=d.id;const pre=document.createElement('pre');pre.textContent=d.command;const actions=document.createElement('div');actions.className='actions';for(const [label,approved,cls] of [['批准',true,''],['拒绝',false,'deny']]){const button=document.createElement('button');button.textContent=label;button.className=cls;button.onclick=async()=>{actions.querySelectorAll('button').forEach(b=>b.disabled=true);try{await request('/approve',{id:d.id,approved})}catch(e){status.textContent=e.message;actions.querySelectorAll('button').forEach(b=>b.disabled=false)}};actions.append(button)}node.append(pre,actions);status.textContent='等待你批准或拒绝命令'}
 if(event.kind==='decision'){const node=[...chat.querySelectorAll('[data-id]')].find(n=>n.dataset.id===d.id);if(node){node.querySelectorAll('button').forEach(b=>b.disabled=true);const note=document.createElement('div');note.textContent=d.approved?'已批准，正在执行…':'已拒绝';node.append(note)}}
@@ -27,7 +30,7 @@ if(event.kind==='tool_result'){let text=d.error||(d.text!==undefined?d.text:`退
 if(event.kind==='reset')chat.replaceChildren();
 if(event.kind==='done')status.textContent='就绪';
 }
-async function poll(){try{const data=await request('/events?after='+offset);data.events.forEach(render);offset=data.next;busy=data.busy;document.querySelector('#send').disabled=busy;document.querySelector('#reset').disabled=busy;if(busy&&!chat.querySelector('.approval button:not(:disabled)'))status.textContent='助手正在处理…';if(data.events.length)window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'})}catch(e){status.textContent='连接中断，请确认本地服务仍在运行。'}setTimeout(poll,500)}
+async function poll(){try{const data=await request('/events?after='+offset);data.events.forEach(render);offset=data.next;busy=data.busy;document.querySelector('#agents').textContent=(data.agents||[]).map(a=>`${a.id} · ${a.agent} · ${a.state} · ${a.turns}轮 · ${a.tokens} tokens · ${a.seconds}s`).join('\n')||'暂无子 agent';document.querySelector('#send').disabled=busy;document.querySelector('#reset').disabled=busy;if(busy&&!chat.querySelector('.approval button:not(:disabled)'))status.textContent='助手正在处理…';if(data.events.length)window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'})}catch(e){status.textContent='连接中断，请确认本地服务仍在运行。'}setTimeout(poll,500)}
 document.querySelector('#form').onsubmit=async e=>{e.preventDefault();if(busy||!input.value.trim())return;const message=input.value;document.querySelector('#send').disabled=true;try{await request('/chat',{message});input.value='';busy=true;status.textContent='助手正在处理…'}catch(e){status.textContent=e.message;document.querySelector('#send').disabled=false}};
 input.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();document.querySelector('#form').requestSubmit()}};
 document.querySelector('#reset').onclick=async()=>{try{await request('/reset',{});status.textContent='已开始新对话'}catch(e){status.textContent=e.message}};

@@ -125,28 +125,42 @@ class PluginRuntime:
             if self.allow - self.routes.keys():
                 raise ValueError('An allowlisted tool was not loaded; check settings.json.')
             self.ready.set()
+            self.pending_calls = set()
             while True:
                 name, arguments, future = await self.queue.get()
                 if name is None:
+                    for task in list(self.pending_calls):
+                        task.cancel()
+                    if self.pending_calls:
+                        await asyncio.gather(*self.pending_calls,return_exceptions=True)
                     future.set_result(None)
                     break
-                try:
-                    if name not in self.routes:
-                        result = {'is_error': True, 'text': 'Unknown MCP tool.'}
-                    else:
-                        client, remote = self.routes[name]
-                        response = await client.call_tool(remote, arguments)
-                        result = {'is_error': response.is_error,
-                            'text': self.redact('\n'.join(b.text for b in response.content if getattr(b, 'type', None) == 'text'))}
-                    if not future.cancelled():
-                        future.set_result(result)
-                except Exception:
-                    if not future.cancelled():
-                        future.set_result({'is_error': True, 'text': 'MCP call failed; check the server and retry.'})
+                task = asyncio.create_task(self._dispatch(name,arguments,future))
+                self.pending_calls.add(task)
+                task.add_done_callback(self.pending_calls.discard)
+
+    async def _dispatch(self, name, arguments, future):
+        try:
+            if name not in self.routes:
+                result = {'is_error':True,'text':'Unknown MCP tool.'}
+            else:
+                client, remote = self.routes[name]
+                response = await client.call_tool(remote, arguments)
+                result = {'is_error':response.is_error,
+                          'text':self.redact('\n'.join(b.text for b in response.content if getattr(b,'type',None)=='text'))}
+            if not future.done():
+                future.set_result(result)
+        except asyncio.CancelledError:
+            if not future.done():
+                future.set_result({'is_error':True,'text':'MCP call cancelled; no automatic retry. Delivery of side effects may be uncertain.'})
+            raise
+        except Exception:
+            if not future.done():
+                future.set_result({'is_error':True,'text':'MCP call failed; check server. Do not automatically retry side effects.'})
 
     async def _request(self, name, arguments):
         future = self.loop.create_future()
-        await self.queue.put((name, arguments, future))
+        await self.queue.put((name,arguments,future))
         return await future
 
     def call(self, name, arguments):

@@ -29,33 +29,64 @@ BASH = {
 }
 
 
-def run_bash(command, workdir, timeout=60):
-    shell = ["powershell", "-NoProfile", "-Command"] if os.name == "nt" else ["bash", "-lc"]
-    # Temporary files avoid keeping unlimited command output in memory.
+def kill_process_group(process):
+    if process is None:
+        return
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],
+                           capture_output=True, timeout=5)
+        else:
+            # Kill the group even if the shell leader exited before a descendant.
+            os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def run_bash(command, workdir, timeout=60, owner=None):
+    shell = ['powershell','-NoProfile','-Command'] if os.name == 'nt' else ['bash','-lc']
     import tempfile
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        process = subprocess.Popen(
-            shell + [command], cwd=workdir, stdin=subprocess.DEVNULL,
-            stdout=stdout, stderr=stderr, start_new_session=os.name != "nt",
-        )
+        options = {'creationflags':subprocess.CREATE_NEW_PROCESS_GROUP} if os.name=='nt' else {'start_new_session':True}
+        if owner:
+            with owner._process_lock:
+                owner._check_cancel()
+                if owner.deadline is not None and time.monotonic() >= owner.deadline:
+                    raise AgentLimitError(f'Time limit exceeded ({owner.time_limit} seconds).')
+                process = subprocess.Popen(shell+[command],cwd=workdir,stdin=subprocess.DEVNULL,
+                                           stdout=stdout,stderr=stderr,**options)
+                owner.process = process
+        else:
+            process = subprocess.Popen(shell+[command],cwd=workdir,stdin=subprocess.DEVNULL,
+                                       stdout=stdout,stderr=stderr,**options)
+        deadline = time.monotonic()+timeout
         timed_out = False
         try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True)
-                process.kill()
-            else:
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+            while process.poll() is None:
+                if owner and owner.stop_event.is_set():
+                    kill_process_group(process)
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    kill_process_group(process)
+                    break
+                try:
+                    process.wait(timeout=min(.05,max(.001,deadline-time.monotonic())))
+                except subprocess.TimeoutExpired:
+                    pass
+            process.wait(timeout=5)
+        finally:
+            # Do not leave background descendants after the approved command ends.
+            kill_process_group(process)
+            if owner:
+                with owner._process_lock:
+                    owner.process = None
         def tail(file):
-            size = file.seek(0, 2)
-            file.seek(max(0, size - 5000))
-            text = file.read().decode("utf-8", errors="replace")
-            return ("[Earlier output truncated]\n" if size > 5000 else "") + text
-        return {"stdout": tail(stdout), "stderr": tail(stderr),
-                "exit_code": process.returncode, "timed_out": timed_out}
+            size=file.seek(0,2);file.seek(max(0,size-5000))
+            text=file.read().decode('utf-8',errors='replace')
+            return ('[Earlier output truncated]\n' if size>5000 else '')+text
+        return {'stdout':tail(stdout),'stderr':tail(stderr),'exit_code':process.returncode,
+                'timed_out':timed_out,'stopped':bool(owner and owner.stop_event.is_set())}
 
 
 def is_prose_approval_request(text):
@@ -63,6 +94,10 @@ def is_prose_approval_request(text):
     requesting = re.search(r'请(?:先)?(?:批准|授权|允许)|批准后|需要.{0,30}(?:批准|授权)|please.{0,30}(?:approve|authorize|permission)', text, re.I)
     tool_context = re.search(r'bash|MCP|SKILL\.md|工具|命令|tool|command', text, re.I)
     return bool(requesting and tool_context)
+
+
+class AgentStoppedError(RuntimeError):
+    """A permanently cancelled child cannot perform further work."""
 
 
 class AgentLimitError(RuntimeError):
@@ -86,6 +121,7 @@ class Agent:
         self.inbox = queue.Queue()
         self.stop_event = threading.Event()
         self.process = None
+        self._process_lock = threading.RLock()
         self.turns = 0
         self.usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
         self.started_at, self.deadline = None, None
@@ -110,8 +146,8 @@ class Agent:
         if telegram and system_prompt is None:
             prompt += '\nTelegram mode: the harness owns incoming messages and sends your final reply. Never poll messages via bash or tools. Use send_message only for short progress updates. For phone replies use at most 350 Chinese characters or 180 English words. Avoid tables. Put the requested verdict and net-of-cost simulation figures before secondary diagnostics; include data date and limitations.'
         if self.agent_types:
-            from delegation import DELEGATE
-            self.tools.append(copy.deepcopy(DELEGATE))
+            from delegation import DELEGATE, SUBAGENT
+            self.tools.extend(copy.deepcopy([DELEGATE, SUBAGENT]))
             from agent_types import agent_type_prompt
             prompt += '\n\n' + agent_type_prompt(self.agent_types)
         self.system_prompt = prompt
@@ -180,8 +216,10 @@ class Agent:
             if self.agent_types and self.delegations is None:
                 from delegation import Delegations
                 self.delegations = Delegations(self)
-            self.state = 'running'
-            self.report = ''
+            with self._process_lock:
+                self._check_cancel()
+                self.state = 'running'
+                self.report = ''
             if self.started_at is None:
                 self.started_at = time.monotonic()
                 self.deadline = self.started_at + self.time_limit
@@ -190,17 +228,47 @@ class Agent:
                 result = self._ask(prompt, approve, emit,
                                    self.max_turns if max_rounds is None else max_rounds)
             except BaseException as error:
-                self.state = 'failed'
-                self.failure_reason = str(error) if isinstance(error, AgentLimitError) else 'Agent turn failed.'
+                if self.state not in ('stopped','failed'):
+                    self.state = 'stopped' if isinstance(error, AgentStoppedError) else 'failed'
+                    self.failure_reason = str(error) if isinstance(error, (AgentLimitError,AgentStoppedError)) else 'Agent turn failed.'
                 self._log('state', {'state': self.state, 'reason': self.failure_reason})
                 raise
-            self.report, self.state = result, 'idle'
+            with self._process_lock:
+                self._check_cancel()
+                self.report, self.state = result, 'idle'
             self._log('state', {'state': self.state, 'report': result})
             return result
         finally:
             self._turn_lock.release()
 
+    def take_pending(self):
+        messages = []
+        while True:
+            try:
+                messages.append(self.inbox.get_nowait())
+            except queue.Empty:
+                return '\n\n'.join(messages)
+
+    def cancel(self, state='stopped', reason='Stopped.'):
+        with self._process_lock:
+            self.state, self.failure_reason = state, reason
+            self.stop_event.set()
+            kill_process_group(self.process)
+        self._log('state', {'state':state,'reason':reason})
+
+    def _check_cancel(self):
+        if self.stop_event.is_set():
+            if self.state == 'failed':
+                raise AgentLimitError(self.failure_reason or 'Agent failed.')
+            raise AgentStoppedError(self.failure_reason or 'Agent stopped.')
+
+    def close(self):
+        if self.delegations:
+            self.delegations.close()
+        self.cancel(reason='Session ended.')
+
     def _check_limits(self):
+        self._check_cancel()
         if self.agent_type == 'main' and self.id == 'main':
             return
         if self.deadline is not None and time.monotonic() >= self.deadline:
@@ -221,7 +289,16 @@ class Agent:
         final_repairs = 0
         for round_index in range(max_rounds + 1):
             self._check_limits()
+            pending = self.take_pending()
+            if pending:
+                self._append({'role':'user','content':pending})
+            if self.delegations:
+                notes = self.delegations.drain_notes()
+                if notes:
+                    self._append({'role':'user','content':'[subagent notes] '+json.dumps(notes,ensure_ascii=False)})
             model_options = {'model': self.model} if self.model else {}
+            if self.agent_type != 'main' or self.id != 'main':
+                model_options['request_timeout'] = min(60,max(.01,self.deadline-time.monotonic()))
             result = complete(self.messages, **model_options, tools=tools,
                               max_tokens=2048, tool_choice='none' if denied or force_final or round_index == max_rounds else ('required' if force_proposal else 'auto'))
             force_proposal = False
@@ -229,6 +306,7 @@ class Agent:
             usage = result.get('usage', {})
             self._record_usage(usage)
             emit('usage', usage)
+            self._check_cancel()
             if self.agent_type != 'main' or self.id != 'main':
                 if time.monotonic() >= self.deadline:
                     raise AgentLimitError(f'Time limit exceeded ({self.time_limit} seconds).')
@@ -278,18 +356,28 @@ class Agent:
                         output = {'error': 'Tool round limit reached.'}
                     else:
                         skill_path = self.skill_read_path(arguments['command']) if name == 'bash' else None
-                        internal_delegate = name == 'delegate' and self.delegations is not None
+                        internal_delegate = name in ('delegate','subagent') and self.delegations is not None
                         allowed = internal_delegate or skill_path is not None or (name != 'bash' and self.runtime and name in self.runtime.allow)
                         description = arguments['command'] if name == 'bash' else 'MCP tool ' + name + '\n' + json.dumps(arguments, ensure_ascii=False)
-                        if allowed or approve(redact(description)):
+                        approved = allowed
+                        if not approved:
+                            approved = (self.delegations.approval(approve,redact(description))
+                                        if self.delegations else approve(redact(description)))
+                        self._check_cancel()
+                        if self.agent_type != 'main' or self.id != 'main':
+                            if time.monotonic() >= self.deadline:
+                                raise AgentLimitError(f'Time limit exceeded ({self.time_limit} seconds).')
+                        if approved:
                             if name == 'delegate':
                                 output = self.delegations.run(approve=approve, emit=emit, **arguments)
+                            elif name == 'subagent':
+                                output = self.delegations.dispatch(approve=approve,emit=emit,**arguments)
                             elif name == 'bash':
                                 if skill_path is not None:
                                     output = {'stdout': skill_path.read_text(), 'stderr': '', 'exit_code': 0}
                                 elif self.agent_type != 'main' or self.id != 'main':
                                     remaining = max(0.01, self.deadline - time.monotonic())
-                                    output = run_bash(arguments['command'], self.workdir, timeout=min(60, remaining))
+                                    output = run_bash(arguments['command'], self.workdir, timeout=min(60, remaining),owner=self)
                                 else:
                                     output = run_bash(arguments['command'], self.workdir)
                             else:
@@ -297,8 +385,11 @@ class Agent:
                         else:
                             denied = True
                             output = {'error': 'The user declined this tool. Do not retry, substitute another tool, or work around the denial in this turn.'}
+                except (AgentLimitError, AgentStoppedError):
+                    raise
                 except (ValueError, KeyError, TypeError, OSError, RuntimeError, TimeoutError) as error:
                     output = {'error': redact(error)}
+                self._check_cancel()
                 # Raw secrets never enter model context or interface events.
                 encoded = redact(json.dumps(output, ensure_ascii=False))
                 if len(encoded) > 60000:

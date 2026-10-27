@@ -27,7 +27,7 @@ def load_config():
             raise RuntimeError(f'Configure {name} in .env locally.')
     return {name: config[name] for name in ('BASE_URL', 'API_KEY', 'MODEL')}
 
-def complete(messages, **options):
+def complete(messages, request_timeout=60, **options):
     config = load_config()
     payload = {"model": config["MODEL"], "messages": messages, "max_tokens": 1024, **options}
     request = Request(
@@ -36,7 +36,7 @@ def complete(messages, **options):
         headers={"Authorization": "Bearer " + config["API_KEY"], "Content-Type": "application/json"},
     )
     try:
-        with urlopen(request, timeout=60) as response:
+        with urlopen(request, timeout=request_timeout) as response:
             return json.load(response)
     except HTTPError as error:
         raise RuntimeError(f"API returned HTTP {error.code}; check credentials, credits and model.") from None

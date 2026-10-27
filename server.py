@@ -22,22 +22,37 @@ def emit(kind, data):
         events.append({'kind': kind, 'data': data})
 
 
-def approve(command):
+def approve(command, cancel=None):
     global pending
-    item = {'id': secrets.token_hex(16), 'command': command, 'event': threading.Event(), 'approved': False}
+    import time
+    item={'id':secrets.token_hex(16),'command':command,'event':threading.Event(),'approved':False}
     with LOCK:
-        pending = item
-        emit('approval', {'id': item['id'], 'command': command})
-    item['event'].wait()
+        pending=item
+        emit('approval',{'id':item['id'],'command':command})
+    deadline=time.monotonic()+180
+    while not item['event'].wait(.05):
+        if (cancel and cancel.is_set()) or time.monotonic()>=deadline:
+            break
     with LOCK:
-        pending = None
-    return item['approved']
+        cancelled=bool(cancel and cancel.is_set())
+        approved=item['approved'] and not cancelled and item['event'].is_set()
+        if pending is item:
+            pending=None
+        if not item['event'].is_set():
+            emit('decision',{'id':item['id'],'approved':False})
+    return approved
+
+approve.supports_cancel=True
 
 
 def run(prompt):
     global busy
     try:
-        agent.ask(prompt, approve, emit)
+        owner=agent
+        if prompt.strip()=='/agents':
+            emit('text',json.dumps(owner.delegations.list() if owner.delegations else [],ensure_ascii=False,indent=2))
+        else:
+            owner.ask(prompt,approve,lambda kind,data:emit(kind,data) if agent is owner else None)
     except Exception:
         # Keep API response bodies and credentials out of browser errors.
         emit('error', 'Request failed. Check connectivity, API credits and configuration; start a new conversation if needed.')
@@ -78,8 +93,10 @@ class Handler(BaseHTTPRequestHandler):
                 offset = max(0, int(parse_qs(route.query).get('after', ['0'])[0]))
             except ValueError:
                 return self.reply(400, {'error': 'Invalid event offset'})
+            owner=agent
+            statuses=owner.delegations.list() if owner.delegations else []
             with LOCK:
-                return self.reply(200, {'events': events[offset:], 'next': len(events), 'busy': busy})
+                return self.reply(200, {'events': events[offset:], 'next': len(events), 'busy': busy,'agents':statuses})
         return self.reply(404, {'error': 'Not found'})
 
     def do_POST(self):
@@ -98,6 +115,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError()
         except (ValueError, json.JSONDecodeError):
             return self.reply(400, {'error': 'Invalid request'})
+        old_agent=None
         with LOCK:
             if self.path == '/chat':
                 prompt = body.get('message', '')
@@ -119,10 +137,13 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/reset':
                 if busy:
                     return self.reply(409, {'error': 'Finish or deny the current turn first'})
+                old_agent=agent
                 agent = Agent(runtime=runtime)
                 emit('reset', None)
             else:
                 return self.reply(404, {'error': 'Not found'})
+        if old_agent is not None:
+            old_agent.close()
         self.reply(200, {'ok': True})
 
 
@@ -157,6 +178,7 @@ def main():
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         print('Stopping agent.', flush=True)
     finally:
+        agent.close()
         if server:
             server.server_close()
         if runtime:
