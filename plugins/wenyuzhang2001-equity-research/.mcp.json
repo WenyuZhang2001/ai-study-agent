@@ -6,7 +6,12 @@
         "run",
         "--script",
         "${CLAUDE_PLUGIN_ROOT}/server.py"
-      ]
+      ],
+      "env": {
+        "BASE_URL": "${BASE_URL}",
+        "API_KEY": "${API_KEY}",
+        "MODEL": "${MODEL}"
+      }
     }
   }
 }

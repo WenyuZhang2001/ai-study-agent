@@ -1,7 +1,7 @@
 {
   "name": "wenyuzhang2001-equity-research",
-  "version": "0.2.0",
-  "description": "Daily tech research, five-session probability validation and cost-aware swing simulation.",
+  "version": "0.3.1",
+  "description": "Daily equity research, news event indicators, quarterly fundamentals and five-session validation.",
   "author": {
     "name": "WenyuZhang2001"
   }

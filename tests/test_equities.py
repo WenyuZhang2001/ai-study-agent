@@ -79,7 +79,7 @@ async def smoke():
     target.mkdir(exist_ok=True)
     async with Client(StdioServerParameters(command='uv', args=['run', '--script', str(SERVER)]), read_timeout_seconds=240) as client:
         tools = await client.list_tools()
-        assert {t.name for t in tools.tools} == {'get_daily_bars', 'analyze_trend', 'backtest_trend', 'daily_watchlist', 'research_swing'}
+        assert {t.name for t in tools.tools} == {'get_daily_bars', 'analyze_trend', 'backtest_trend', 'daily_watchlist', 'research_swing', 'get_company_news', 'analyze_company_news', 'get_company_fundamentals', 'get_company_events'}
         print('Research MCP tools/list passed.', flush=True)
         results = {}
         for name, args in [

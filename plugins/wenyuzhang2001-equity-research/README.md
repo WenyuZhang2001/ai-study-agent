@@ -10,11 +10,11 @@ Requires uv and Python 3.11+. Inline dependencies: official MCP SDK v2, yfinance
 uv run --script /absolute/path/to/wenyuzhang2001-equity-research/server.py
 ```
 
-The harness discovers the folder automatically under plugins/: `uv run server.py --telegram` starts phone questions and approvals. Full setup: https://github.com/WenyuZhang2001/ai-study-agent . Bash and research tools require explicit approval by default.
+The harness discovers the folder automatically under plugins/: `uv run server.py --telegram` starts phone questions and approvals. Full setup: https://github.com/WenyuZhang2001/ai-study-agent . The local harness allowlists the nine research tools and registered skill reads; other shell commands and unknown tools require approval.
 
 Claude Code: `claude --plugin-dir /absolute/path/to/this/plugin`; validate with `claude plugin validate /absolute/path/to/this/plugin` if installed. Codex: `codex mcp add class_equities -- uv run --script /absolute/path/to/this/plugin/server.py`, using the installed CLI's help. The plugin was actually tested in Codex with ephemeral equivalent stdio configuration; it returned the historical TSLA research answer. No Claude validation is claimed.
 
-## Five tools
+## Research tools
 
 - get_daily_bars(symbol, as_of='', recent_rows=5): recent OHLCV/adjusted bars and provenance; 1–20 returned rows.
 - analyze_trend(symbol, as_of='', benchmark='QQQ'): SMA50/200, returns, volatility and aligned relative performance.
@@ -51,8 +51,26 @@ These are adaptations, not original-paper replications. Parameters were not tune
 
 Actual historical checks on TSLA/QQQ and NVDA/SMH, eight years ending 2025-10-17, produced NO_DEMONSTRATED_PROBABILITY_EDGE: the model did not beat its simple probability baseline. TSLA's hypothetical USD 1,000 simulation at 10 bps/side ended at USD 1,170.53 with a large drawdown; positive sample profit did not establish a useful prediction model. The student received and reviewed this result from the phone, and Codex independently ran the same research tool.
 
-Only prices/volume are fetched. No news, earnings, fundamentals, personalized portfolio sizing or daily scheduling exists. The selected surviving universe introduces selection bias. Vendor-adjusted histories are revised and not point-in-time vintages. An inspected evaluation is not a new untouched test. High up probability alone does not establish positive expected net return or acceptable downside.
+The historical probability model uses price/volume only. Separate current news/fundamentals tools do not change its features or validation. No portfolio sizing or scheduling exists. The selected surviving universe introduces selection bias. Vendor-adjusted histories are revised and not point-in-time vintages. An inspected evaluation is not a new untouched test. High up probability alone does not establish positive expected net return or acceptable downside.
 
 Source: [yfinance documentation](https://ranaroussi.github.io/yfinance/) and [project](https://github.com/ranaroussi/yfinance). Yahoo/yfinance is an unofficial personal-research feed, not a licensed execution source. Check provider rights before redistribution/commercial use. Generated data/receipts remain local and are not submitted. No secrets or whole files should be sent through Telegram.
 
 The harness regression suite verifies future-data isolation, label maturity, train-only scaling, executable holding horizons, costs, controls, and historical coverage warnings. See its README for commands and completed acceptance tests.
+
+
+## Current context tools (0.3.0)
+
+- get_company_news(symbol, days=7, max_articles=6): Yahoo ticker RSS; NVDA also NVIDIA newsroom RSS. Publication/retrieval UTC, links, title/excerpt scope, exact-title/URL deduplication and feed failures. Limits days 1–30, articles 1–12; drops future/old/undated items. No full articles or complete archive.
+- analyze_company_news(same parameters): isolated no-tool call to configured MODEL, no fallback. Evidence-linked relevance, event category, direction -1/0/+1 and magnitude 0–3; IDs/types/ranges/quote substrings checked. Incomplete/invalid classification yields null. Direct-company business-impact score = 100 * weighted mean(direction*magnitude/3), three-day half-life; descriptive, unvalidated and not a trading signal or calibrated probability. Interpretation can be wrong; promotional/syndicated sources and excerpt coverage matter.
+- get_company_fundamentals(symbol): quarterly revenue YoY/QoQ, margins, YoY margin changes (pp), FCF/margin and cash/debt, with raw inputs, currency and comparison dates. Vendor FCF or OCF + negative signed capex; no FX conversion. Missing same-date rows/currency remain explicit. Not segment deliveries, guidance or surprise estimates.
+
+MCP explicitly passes BASE_URL, API_KEY and MODEL to the reviewed equity process for classification. Credentials are headers, never prompt content/output. Set these locally for standalone classification; news retrieval/fundamentals themselves need no API key. The phone uses selected Nemotron :free; additional classifier requests consume its free request quota. A model failure retains source data and reports a null score.
+
+No historical as_of supported: publication/first-availability is not established by a quarter end or current feed. Do not inject these revised snapshots into historical model backtests. No predictive improvement is claimed; forward timestamped collection and untouched comparisons are required. No paid feeds or brokerage tools added. SEC point-in-time integration is not implemented.
+
+References: [yfinance financial API](https://ranaroussi.github.io/yfinance/reference/api/yfinance.Ticker.get_income_stmt.html), [NVIDIA RSS](https://nvidianews.nvidia.com/rss), [Yahoo ticker RSS](https://finance.yahoo.com/rss/headline?s=NVDA).
+
+
+## Earnings and dividend dates
+
+get_company_events(symbol, horizon_days=14) is read-only and allowlisted. Current stock reports include an Important dates line: earnings date/window and vendor estimate status, New York time/session when supplied; ex-dividend, record, declaration and payment dates. Missing dates remain unavailable, not proof of no dividend. Past dates are last-known, not upcoming. Vendor non-estimated status is not independent issuer verification. No dates are inferred from settlement rules. Flags cover 1–90 calendar days, not trading sessions. get_company_fundamentals embeds the same event_calendar for consistent reports. No historical backtest inputs, reminders, trades or model changes are added.

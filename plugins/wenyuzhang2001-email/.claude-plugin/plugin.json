@@ -1,0 +1,8 @@
+{
+  "name": "wenyuzhang2001-email",
+  "version": "0.1.0",
+  "description": "Dedicated Gmail IMAP/SMTP with recipient restrictions.",
+  "author": {
+    "name": "WenyuZhang2001"
+  }
+}

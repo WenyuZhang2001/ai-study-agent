@@ -1,5 +1,14 @@
 {
   "allow": [
-    "telegram__send_message"
+    "telegram__send_message",
+    "equities__get_daily_bars",
+    "equities__analyze_trend",
+    "equities__backtest_trend",
+    "equities__daily_watchlist",
+    "equities__research_swing",
+    "equities__get_company_news",
+    "equities__analyze_company_news",
+    "equities__get_company_fundamentals",
+    "equities__get_company_events"
   ]
 }

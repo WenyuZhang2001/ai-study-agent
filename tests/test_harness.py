@@ -46,6 +46,34 @@ class FakeRuntime:
 
 
 class AgentTests(unittest.TestCase):
+    def test_registered_skill_read_skips_approval_and_shell(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, 'SKILL.md')
+            path.write_text('registered instructions')
+            runtime = FakeRuntime()
+            runtime.skills = [{'path': str(path)}]
+            responses = [completion([call(arguments={'command': 'cat ' + str(path)})]), completion(content='Done')]
+            with patch('agent.complete', side_effect=responses), patch('agent.run_bash') as shell:
+                approve = unittest.mock.Mock()
+                agent = Agent(runtime=runtime)
+                agent.ask('Read skill', approve, lambda *args: None)
+                approve.assert_not_called()
+                shell.assert_not_called()
+                self.assertIn('registered instructions', json.dumps(agent.messages))
+                for command in ['cat ' + str(path) + '; rm -rf /tmp/x', 'cat /tmp/unknown', 'rm ' + str(path)]:
+                    self.assertIsNone(agent.skill_read_path(command))
+
+    def test_allowlisted_research_skips_approval_unknown_still_asks(self):
+        runtime = FakeRuntime()
+        runtime.allow.add('research__read')
+        responses = [completion([call('research__read', {})]), completion([call(arguments={'command': 'rm file'})]), completion(content='Stopped')]
+        with patch('agent.complete', side_effect=responses), patch('agent.run_bash') as shell:
+            approve = unittest.mock.Mock(return_value=False)
+            Agent(runtime=runtime).ask('Research', approve, lambda *args: None)
+            self.assertEqual(runtime.calls[0][0], 'research__read')
+            approve.assert_called_once_with('rm file')
+            shell.assert_not_called()
+
     def test_denial_blocks_batch_and_later_attempts(self):
         responses = [completion([call(), call('telegram__send_message', {'text': 'bypass'}, 'call2')]),
                      completion([call(arguments={'command': 'ls'}, id='call3')]),
