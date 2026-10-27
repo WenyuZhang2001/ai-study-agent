@@ -60,6 +60,13 @@ class PluginRuntime:
             raise RuntimeError('Plugin startup timed out; check local configuration and dependencies.')
         if self.error:
             raise RuntimeError(self.error)
+        from agent import BASH
+        from agent_types import load_agent_types
+        try:
+            self.agent_types = load_agent_types(self.root / 'agents', [BASH, *self.tools])
+        except ValueError:
+            self.close()
+            raise
         print(json.dumps({'plugins': self.plugins, 'tools': [t['function']['name'] for t in self.tools],
                           'skills': self.skills}, ensure_ascii=False), flush=True)
 

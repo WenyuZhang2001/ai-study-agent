@@ -65,6 +65,10 @@ def is_prose_approval_request(text):
     return bool(requesting and tool_context)
 
 
+class AgentLimitError(RuntimeError):
+    """A safe, explicit per-child resource-limit failure."""
+
+
 class Agent:
     def __init__(self, workdir=ROOT, runtime=None, telegram=False, *,
                  agent_id='main', agent_type='main', system_prompt=None,
@@ -94,11 +98,22 @@ class Agent:
                     if not (telegram and t['function']['name'] == 'telegram__wait_for_messages')]
                     if runtime else [])
         self.tools = copy.deepcopy(defaults if tools is None else tools)
+        if agent_type != 'main' or agent_id != 'main':
+            self.tools = [t for t in self.tools if t['function']['name'] not in {'delegate', 'subagent'}]
+        self.model = None
+        self.delegations = None
+        self.session_usage = {'subagent_tokens': 0}
+        self.agent_types = getattr(runtime, 'agent_types', {}) if agent_type == 'main' and agent_id == 'main' else {}
         prompt = (ROOT / 'system_prompt.md').read_text() if system_prompt is None else system_prompt
         if runtime and system_prompt is None:
             prompt += '\n\n' + runtime.skill_prompt()
         if telegram and system_prompt is None:
             prompt += '\nTelegram mode: the harness owns incoming messages and sends your final reply. Never poll messages via bash or tools. Use send_message only for short progress updates. For phone replies use at most 350 Chinese characters or 180 English words. Avoid tables. Put the requested verdict and net-of-cost simulation figures before secondary diagnostics; include data date and limitations.'
+        if self.agent_types:
+            from delegation import DELEGATE
+            self.tools.append(copy.deepcopy(DELEGATE))
+            from agent_types import agent_type_prompt
+            prompt += '\n\n' + agent_type_prompt(self.agent_types)
         self.system_prompt = prompt
         self.messages = [{'role': 'system', 'content': prompt}]
         self._initial_log_written = False
@@ -162,6 +177,9 @@ class Agent:
             if not self._initial_log_written:
                 self._log('message', self.messages[0])
                 self._initial_log_written = True
+            if self.agent_types and self.delegations is None:
+                from delegation import Delegations
+                self.delegations = Delegations(self)
             self.state = 'running'
             self.report = ''
             if self.started_at is None:
@@ -171,8 +189,9 @@ class Agent:
             try:
                 result = self._ask(prompt, approve, emit,
                                    self.max_turns if max_rounds is None else max_rounds)
-            except BaseException:
-                self.state, self.failure_reason = 'failed', 'Agent turn failed.'
+            except BaseException as error:
+                self.state = 'failed'
+                self.failure_reason = str(error) if isinstance(error, AgentLimitError) else 'Agent turn failed.'
                 self._log('state', {'state': self.state, 'reason': self.failure_reason})
                 raise
             self.report, self.state = result, 'idle'
@@ -180,6 +199,14 @@ class Agent:
             return result
         finally:
             self._turn_lock.release()
+
+    def _check_limits(self):
+        if self.agent_type == 'main' and self.id == 'main':
+            return
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise AgentLimitError(f'Time limit exceeded ({self.time_limit} seconds).')
+        if self.turns >= self.max_turns:
+            raise AgentLimitError(f'Turn limit exceeded ({self.max_turns} model calls).')
 
     def _ask(self, prompt, approve, emit, max_rounds):
         """Existing loop and approval semantics, using per-agent tools/state."""
@@ -193,13 +220,18 @@ class Agent:
         force_final = False
         final_repairs = 0
         for round_index in range(max_rounds + 1):
-            result = complete(self.messages, tools=tools,
+            self._check_limits()
+            model_options = {'model': self.model} if self.model else {}
+            result = complete(self.messages, **model_options, tools=tools,
                               max_tokens=2048, tool_choice='none' if denied or force_final or round_index == max_rounds else ('required' if force_proposal else 'auto'))
             force_proposal = False
             self.turns += 1
             usage = result.get('usage', {})
             self._record_usage(usage)
             emit('usage', usage)
+            if self.agent_type != 'main' or self.id != 'main':
+                if time.monotonic() >= self.deadline:
+                    raise AgentLimitError(f'Time limit exceeded ({self.time_limit} seconds).')
             if not self.first_usage_reported:
                 print('First model call input tokens: ' + str(usage.get('prompt_tokens', 'not reported')), flush=True)
                 self.first_usage_reported = True
@@ -246,12 +278,20 @@ class Agent:
                         output = {'error': 'Tool round limit reached.'}
                     else:
                         skill_path = self.skill_read_path(arguments['command']) if name == 'bash' else None
-                        allowed = skill_path is not None or (name != 'bash' and self.runtime and name in self.runtime.allow)
+                        internal_delegate = name == 'delegate' and self.delegations is not None
+                        allowed = internal_delegate or skill_path is not None or (name != 'bash' and self.runtime and name in self.runtime.allow)
                         description = arguments['command'] if name == 'bash' else 'MCP tool ' + name + '\n' + json.dumps(arguments, ensure_ascii=False)
                         if allowed or approve(redact(description)):
-                            if name == 'bash':
-                                output = ({'stdout': skill_path.read_text(), 'stderr': '', 'exit_code': 0}
-                                          if skill_path is not None else run_bash(arguments['command'], self.workdir))
+                            if name == 'delegate':
+                                output = self.delegations.run(approve=approve, emit=emit, **arguments)
+                            elif name == 'bash':
+                                if skill_path is not None:
+                                    output = {'stdout': skill_path.read_text(), 'stderr': '', 'exit_code': 0}
+                                elif self.agent_type != 'main' or self.id != 'main':
+                                    remaining = max(0.01, self.deadline - time.monotonic())
+                                    output = run_bash(arguments['command'], self.workdir, timeout=min(60, remaining))
+                                else:
+                                    output = run_bash(arguments['command'], self.workdir)
                             else:
                                 output = self.runtime.call(name, arguments)
                         else:

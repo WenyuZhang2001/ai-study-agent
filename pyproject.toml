@@ -3,4 +3,4 @@ name = "ai-study-agent"
 version = "0.2.0"
 description = "A small agent with MCP plugins and Telegram approvals"
 requires-python = ">=3.11"
-dependencies = ["mcp>=2,<3"]
+dependencies = ["mcp>=2,<3", "PyYAML>=6,<7"]
