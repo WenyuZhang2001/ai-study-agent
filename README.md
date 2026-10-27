@@ -92,6 +92,8 @@ Week 4 implementation and five live demos are complete; 89 regression tests pass
 
 The submission includes only the email plugin, agent definitions, a README and five privacy-reviewed transcripts. Credentials, private runtime logs, receipts and discarded test attempts stay local. See [SUBAGENTS.md](SUBAGENTS.md) for threading, state, limits, approval handling and process-group termination. Existing running processes must be restarted to load the new code; the phone receiver was not restarted during these tests.
 
+Week 4 submission: https://github.com/huangzesen/ai-in-research-homework/pull/25 (open; class-agent reply remains pending).
+
 Week 3 submission: https://github.com/huangzesen/ai-in-research-homework/pull/18 .
 
 ## Current news and company operations
