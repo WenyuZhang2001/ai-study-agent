@@ -8,3 +8,13 @@ research-output/
 
 # Private agent conversations and tool results
 logs/
+
+# Private watcher state
+state/
+
+# Generated personal memory may contain private research context
+memory/
+
+.DS_Store
+
+service/com.wenyuzhang.ai-study-agent.plist

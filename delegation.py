@@ -74,12 +74,15 @@ class Delegations:
             identity = f'sa-{self._next_id}'
             kind = self.main.agent_types[agent]
             child = kind.create(agent_id=identity, runtime=self.main.runtime, workdir=self.main.workdir,
-                                log_path=self.main.log_path.parent / f'{identity}.jsonl')
+                                log_path=self.main.log_path.parent / 'children' / self.main.session_id / f'{identity}.jsonl')
+            child.control = self.main.control
             self.children[identity] = child
             rec = Worker(child, self.main._redact(task), background, approve, emit,
                          active_since=time.monotonic())
             child.started_at = rec.active_since
             child.deadline = rec.active_since + child.time_limit
+            if child.control is not None:
+                child.deadline = min(child.deadline, child.control.deadline)
             self.records[identity] = rec
             return rec
 
@@ -203,8 +206,11 @@ class Delegations:
 
     def _launch(self, rec, task):
         rec.state, rec.active, rec.notified = 'running', True, False
+        rec.child.control = self.main.control
         rec.active_since = time.monotonic()
         rec.child.deadline = rec.active_since + rec.child.time_limit
+        if rec.child.control is not None:
+            rec.child.deadline = min(rec.child.deadline, rec.child.control.deadline)
         rec.thread = threading.Thread(target=self._work, args=(rec, task),
                                       name=rec.child.id, daemon=True)
         rec.thread.start()
@@ -307,12 +313,20 @@ class Delegations:
         if action=='read':return self.read(args['id'],args.get('last',5))
         return self.stop(args['id'])
 
-    def close(self):
+    def cancel_all(self):
+        """Signal every child without waiting on in-flight network calls."""
         with self.condition:
             self._closed.set()
+            count = 0
             for rec in self.records.values():
                 if rec.state not in ('stopped','failed'):
+                    count += 1
                     self._cancel(rec,'stopped','Session ended.')
+            return count
+
+    def close(self):
+        self.cancel_all()
+        with self.condition:
             threads = [r.thread for r in self.records.values() if r.thread]
         # In-flight HTTP calls cannot be killed by Python threads; cancel prevents all
         # later actions. Socket/API timeouts bound cleanup; command groups die at once.

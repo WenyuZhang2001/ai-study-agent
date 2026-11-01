@@ -1,0 +1,7 @@
+# Managed schedule; edits reload on the next minute tick.
+timezone = "America/Los_Angeles"
+
+[[job]]
+name = "weekday-stock-morning"
+task = "股票研究晨报：使用 equities__daily_watchlist 检查现有科技、半导体和 Tesla 观察名单。只基于工具返回的已完成交易日数据，简要报告数据日期、趋势、相对基准表现与缺失数据。不要编造价格或预测，不下单、不发邮件、不新增定时任务；最终中文摘要由 harness 送到 Telegram。"
+cron = "0 8 * * 1-5"

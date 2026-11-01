@@ -155,14 +155,29 @@ def main():
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--no-browser', action='store_true')
     parser.add_argument('--telegram', action='store_true', help='Use Telegram questions and reply-based approvals')
+    parser.add_argument('--always-on', action='store_true', help='Queue Telegram and email events (Week 5 work in progress)')
     parser.add_argument('--no-plugins', action='store_true', help='Run the original bash-only web agent')
     args = parser.parse_args()
-    if args.telegram and args.no_plugins:
-        parser.error('--telegram requires plugins')
+    if (args.telegram or args.always_on) and args.no_plugins:
+        parser.error('--telegram and --always-on require plugins')
+    if args.telegram and args.always_on:
+        parser.error('Choose --telegram or --always-on')
     server = None
+    lease = None
+    if args.always_on:
+        import signal
+        def terminate(signum, frame):
+            raise KeyboardInterrupt()
+        signal.signal(signal.SIGTERM, terminate)
     try:
-        runtime = None if args.no_plugins else PluginRuntime()
-        if args.telegram:
+        if not args.no_plugins:
+            from recovery import ReceiverLease
+            lease = ReceiverLease(ROOT)
+        runtime = None if args.no_plugins else PluginRuntime(durable_telegram=args.always_on)
+        if args.always_on:
+            from always_on import run_always_on
+            run_always_on(runtime)
+        elif args.telegram:
             from telegram_mode import run_telegram
             run_telegram(runtime)
         else:
@@ -176,13 +191,18 @@ def main():
     except KeyboardInterrupt:
         import signal
         signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         print('Stopping agent.', flush=True)
     finally:
         agent.close()
         if server:
             server.server_close()
-        if runtime:
-            runtime.close()
+        try:
+            if runtime:
+                runtime.close()
+        finally:
+            if lease:
+                lease.close()
 
 
 if __name__ == '__main__':

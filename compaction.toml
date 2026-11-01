@@ -1,0 +1,3 @@
+enabled = true
+input_tokens = 20000
+keep_recent_turns = 2

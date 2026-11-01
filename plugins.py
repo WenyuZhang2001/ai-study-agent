@@ -40,8 +40,9 @@ def skill_summary(path):
 
 
 class PluginRuntime:
-    def __init__(self, root=ROOT):
+    def __init__(self, root=ROOT, *, durable_telegram=False):
         self.root = Path(root).resolve()
+        self.durable_telegram = durable_telegram
         self.tools, self.skills, self.plugins, self.routes = [], [], [], {}
         self.environment = local_environment(self.root)
         settings = self.root / 'settings.json'
@@ -103,8 +104,12 @@ class PluginRuntime:
                     # Only basic process environment plus explicitly declared variables.
                     child_env = {k: v for k, v in os.environ.items() if k in {
                         'PATH', 'HOME', 'USERPROFILE', 'SYSTEMROOT', 'TEMP', 'TMP', 'TMPDIR',
-                        'LANG', 'LC_ALL', 'UV_CACHE_DIR', 'UV_PYTHON_INSTALL_DIR'}}
+                        'LANG', 'LC_ALL', 'UV_CACHE_DIR', 'UV_PYTHON_INSTALL_DIR',
+                        'SSL_CERT_FILE', 'SSL_CERT_DIR'}}
                     child_env.update({k: expand(v, variables) for k, v in config.get('env', {}).items()})
+                    child_env['AGENT_CONTROL_ROOT'] = str(self.root)
+                    if self.durable_telegram:
+                        child_env['AGENT_DURABLE_TELEGRAM'] = '1'
                     params = StdioServerParameters(command=expand(config['command'], variables),
                         args=[expand(arg, variables) for arg in config.get('args', [])],
                         env=child_env, cwd=plugin)

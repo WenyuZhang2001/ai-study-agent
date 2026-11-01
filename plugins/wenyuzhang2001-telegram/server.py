@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import sys
+import hashlib
+from pathlib import Path
 
 import httpx
 from mcp.server import MCPServer
@@ -21,10 +23,17 @@ log = logging.getLogger("telegram-plugin")
 
 
 class Telegram:
-    def __init__(self, token, chat_id, client):
+    def __init__(self, token, chat_id, client, cursor_path=None):
         self.token, self.chat_id, self.client = token, chat_id, client
         self.offset = 0
         self.lock = asyncio.Lock()
+        self.cursor_path = Path(cursor_path) if cursor_path else None
+        self.offered_offset = self.offset
+        if self.cursor_path and self.cursor_path.exists():
+            offset = json.loads(self.cursor_path.read_text())['offset']
+            if type(offset) is not int or offset < 0:
+                raise ValueError('Invalid Telegram cursor; restore local state before starting.')
+            self.offset = offset
 
     async def request(self, method, **payload):
         try:
@@ -68,7 +77,9 @@ class Telegram:
             updates = await self.request("getUpdates", offset=self.offset, timeout=seconds)
             messages = []
             for update in updates:
-                self.offset = max(self.offset, update["update_id"] + 1)
+                self.offered_offset = max(self.offered_offset, update['update_id'] + 1)
+                if not self.cursor_path:
+                    self.offset = self.offered_offset
                 message = update.get("message", {})
                 chat = message.get("chat", {})
                 if chat.get("id") != self.chat_id or chat.get("type") != "private":
@@ -77,7 +88,26 @@ class Telegram:
                 if isinstance(message.get("text"), str):
                     messages.append({"message_id": message["message_id"], "text": message["text"],
                                      "reply_to_message_id": message.get("reply_to_message", {}).get("message_id")})
+            if self.cursor_path:
+                return json.dumps({'messages': messages, 'next_offset': max(self.offset, self.offered_offset)}, ensure_ascii=False)
             return json.dumps(messages, ensure_ascii=False) if messages else "No new messages."
+
+    async def acknowledge(self, offset):
+        async with self.lock:
+            if not self.cursor_path or type(offset) is not int or not self.offset <= offset <= max(self.offset, self.offered_offset):
+                raise ValueError('Invalid durable Telegram acknowledgement.')
+            if offset == self.offset:
+                return 'No acknowledgement change.'
+            self.cursor_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            temporary = self.cursor_path.with_suffix('.tmp')
+            fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                json.dump({'offset': offset}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(self.cursor_path)
+            self.offset = offset
+            return 'Acknowledged durable Telegram batch.'
 
 
 telegram = None
@@ -97,8 +127,13 @@ async def lifespan(server):
     except ValueError:
         raise RuntimeError("TELEGRAM_CHAT_ID must be a positive private-chat integer.") from None
     async with httpx.AsyncClient(timeout=65) as client:
-        telegram = Telegram(token, chat_id, client)
-        await telegram.skip_backlog()
+        cursor = None
+        if os.environ.get('AGENT_DURABLE_TELEGRAM') == '1':
+            namespace = hashlib.sha256((token + ':' + raw_chat_id).encode()).hexdigest()[:20]
+            cursor = Path(os.environ['AGENT_CONTROL_ROOT']) / 'state' / ('telegram-' + namespace + '.json')
+        telegram = Telegram(token, chat_id, client, cursor)
+        if cursor is None:
+            await telegram.skip_backlog()
         try:
             yield
         finally:
@@ -135,6 +170,15 @@ async def wait_for_messages(seconds: int = 30) -> str:
     try:
         return await telegram.wait(seconds)
     except RuntimeError as error:
+        raise ToolError(str(error)) from None
+
+
+@mcp.tool()
+async def ack_updates(offset: int) -> str:
+    """Harness-only acknowledgement after incoming events have been durably recorded. Never call from the model."""
+    try:
+        return await telegram.acknowledge(offset)
+    except (RuntimeError, ValueError) as error:
         raise ToolError(str(error)) from None
 
 

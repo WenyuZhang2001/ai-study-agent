@@ -56,6 +56,9 @@ class TelegramChannel:
             if result['is_error']:
                 raise RuntimeError('Telegram polling failed.')
             messages = [] if result['text'] == 'No new messages.' else json.loads(result['text'])
+            if isinstance(messages, dict):
+                self.pending_offset = messages['next_offset']
+                messages = messages['messages']
             self.poll_failures = 0
             return messages
         except (RuntimeError, TimeoutError, ValueError, KeyError, TypeError):

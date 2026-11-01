@@ -1,0 +1,5 @@
+timezone = "America/Los_Angeles"
+turns_per_wake = 8
+minutes_per_wake = 5
+tokens_per_day = 1000000
+replies_per_sender = 2

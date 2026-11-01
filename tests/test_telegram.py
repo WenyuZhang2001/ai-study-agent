@@ -3,6 +3,7 @@ import unittest
 import importlib.util
 import json
 import os
+import tempfile
 from pathlib import Path
 import httpx
 from mcp import Client
@@ -57,6 +58,28 @@ async def main():
 class TelegramTests(unittest.IsolatedAsyncioTestCase):
     async def test_mocked_chat_security_and_delivery(self):
         await main()
+
+    async def test_durable_poll_replays_until_ack_and_survives_process_restart(self):
+        spec = importlib.util.spec_from_file_location('telegram_durable_server', SERVER)
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        update = {'update_id': 11, 'message': {'message_id': 2, 'chat': {'id': 123, 'type': 'private'}, 'text': 'durable hello'}}
+        calls = []
+        def handle(request):
+            payload = json.loads(request.content); calls.append(payload)
+            return httpx.Response(200, json={'ok': True, 'result': [update] if payload['offset'] <= 11 else []})
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'cursor.json'
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+                bot = module.Telegram('fake-test-token', 123, http, path)
+                self.assertEqual(json.loads(await bot.wait(0))['messages'][0]['text'], 'durable hello')
+                self.assertEqual(bot.offset, 0)
+                restarted = module.Telegram('fake-test-token', 123, http, path)
+                self.assertEqual(len(json.loads(await restarted.wait(0))['messages']), 1)
+                await restarted.acknowledge(12)
+                again = module.Telegram('fake-test-token', 123, http, path)
+                self.assertEqual(json.loads(await again.wait(0))['messages'], [])
+                self.assertEqual(again.offset, 12)
+                self.assertFalse(any(p['offset'] == -1 for p in calls))
 
 
 if __name__ == "__main__":
